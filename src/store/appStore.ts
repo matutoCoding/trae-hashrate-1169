@@ -13,6 +13,8 @@ import type {
   User,
   DashboardStats,
   MergeCandidate,
+  ApprovalTrackItem,
+  ApprovalStatus,
 } from '@/types';
 import {
   mockFleets,
@@ -63,6 +65,8 @@ interface AppState {
     splitPoint: string,
     reason: string
   ) => { ok: boolean; message?: string };
+
+  processTimeouts: () => void;
 
   sendReminder: (approvalRequestId: string, toEscalation?: boolean) => { ok: boolean; message?: string };
   processApprovalAction: (
@@ -142,7 +146,10 @@ export const useAppStore = create<AppState>((set, get) => ({
         updatedSlotIds.includes(s.id) ? { ...s, occupancyId: occupancy.id, updatedAt: new Date().toISOString() } : s
       ),
     }));
-    setTimeout(() => get().recomputeMergeCandidates(), 0);
+    setTimeout(() => {
+      get().recomputeMergeCandidates();
+      get().recomputeNodeDeadlines();
+    }, 0);
     return { ok: true };
   },
 
@@ -151,22 +158,30 @@ export const useAppStore = create<AppState>((set, get) => ({
     const occ = occupancies.find(o => o.id === occupancyId);
     if (!occ) return { ok: false, message: '未找到该占用记录' };
     const result = doSplit(occ, slots, splitPoint, reason, currentUser.id, currentUser.name);
-    const idsToRemove = occ.slotIds.filter(id => !result.newSlots.find(ns => ns.id === id));
-    const keptSlots = slots.filter(s => !idsToRemove.includes(s.id));
-    const updatedSlots = keptSlots.map(s => {
-      const nb = result.newSlots.find(n => n.id === s.id);
-      if (nb) return nb;
-      if (result.beforeOcc.slotIds.includes(s.id)) return { ...s, occupancyId: result.beforeOcc.id };
-      if (result.afterOcc.slotIds.includes(s.id)) return { ...s, occupancyId: result.afterOcc.id };
-      return s;
+
+    const originalSlotIds = new Set(occ.slotIds);
+    const remainingSlots = slots.filter(s => !originalSlotIds.has(s.id));
+
+    const buildSlotWithOcc = (slot: PerformanceSlot, occId: string): PerformanceSlot => ({
+      ...slot,
+      occupancyId: occId,
+      updatedAt: new Date().toISOString(),
     });
-    const allSlots = [
-      ...updatedSlots,
-      ...result.newSlots.filter(ns => !updatedSlots.find(s => s.id === ns.id)).map(ns => ({
-        ...ns,
-        occupancyId: result.beforeOcc.slotIds.includes(ns.id) ? result.beforeOcc.id : result.afterOcc.id,
-      })),
+
+    const finalSlots: PerformanceSlot[] = [
+      ...remainingSlots,
+      ...result.beforeOcc.slotIds.map(sid => {
+        const foundInNew = result.newSlots.find(n => n.id === sid);
+        const foundOrig = slots.find(s => s.id === sid);
+        return buildSlotWithOcc(foundInNew || foundOrig!, result.beforeOcc.id);
+      }),
+      ...result.afterOcc.slotIds.map(sid => {
+        const foundInNew = result.newSlots.find(n => n.id === sid);
+        const foundOrig = slots.find(s => s.id === sid);
+        return buildSlotWithOcc(foundInNew || foundOrig!, result.afterOcc.id);
+      }),
     ];
+
     set(state => ({
       occupancies: [
         ...state.occupancies.map(o => o.id === occupancyId ? { ...o, status: 'split' as const } : o),
@@ -174,9 +189,63 @@ export const useAppStore = create<AppState>((set, get) => ({
         result.afterOcc,
       ],
       splitLogs: [...state.splitLogs, result.splitLog],
-      slots: allSlots,
+      slots: finalSlots,
     }));
+    setTimeout(() => {
+      get().recomputeMergeCandidates();
+      get().recomputeNodeDeadlines();
+    }, 0);
     return { ok: true };
+  },
+
+  processTimeouts: () => {
+    const state0 = get();
+    state0.recomputeNodeDeadlines();
+    const { nodeDeadlines, reminders, approvalRequests } = get();
+    const additionalReminders: ReminderRecord[] = [];
+    const trackUpdates: Map<string, ApprovalTrackItem[]> = new Map();
+    const escalatedReqIds: string[] = [];
+
+    for (const info of nodeDeadlines) {
+      const existingReminders = reminders.filter(r => r.approvalRequestId === info.approvalRequestId && r.nodeId === info.nodeId);
+      const existingAutoReminder = existingReminders.find(r => r.isAuto && !r.isEscalation);
+      const existingEscalation = existingReminders.find(r => r.isAuto && r.isEscalation);
+
+      if (info.remaining.isOverdue && !existingAutoReminder) {
+        const { reminder, trackItem } = createAutoReminder(info);
+        additionalReminders.push(reminder);
+        const prev = trackUpdates.get(info.approvalRequestId) ?? [];
+        prev.push(trackItem);
+        trackUpdates.set(info.approvalRequestId, prev);
+      }
+
+      if (info.escalationPending && !existingEscalation && !info.isEscalated && info.escalationTargetId) {
+        const result = createEscalation(info);
+        if (result) {
+          const { reminder, trackItem } = result;
+          additionalReminders.push(reminder);
+          const prev = trackUpdates.get(info.approvalRequestId) ?? [];
+          prev.push(trackItem);
+          trackUpdates.set(info.approvalRequestId, prev);
+          escalatedReqIds.push(info.approvalRequestId);
+        }
+      }
+    }
+
+    if (additionalReminders.length === 0 && escalatedReqIds.length === 0 && trackUpdates.size === 0) return;
+
+    set(state => ({
+      reminders: [...state.reminders, ...additionalReminders],
+      approvalRequests: state.approvalRequests.map(r => {
+        const tracks = trackUpdates.get(r.id);
+        const escalateMark = escalatedReqIds.includes(r.id);
+        if (!tracks && !escalateMark) return r;
+        const next: ApprovalRequest = { ...r };
+        if (escalateMark) next.status = 'escalated';
+        if (tracks) next.timeline = [...r.timeline, ...tracks];
+        return next;
+      }),
+    }));
   },
 
   sendReminder: (requestId, toEscalation = false) => {
@@ -213,7 +282,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     if (!flow) return { ok: false, message: '未找到审批流程' };
     const currentNode = flow.nodes.find(n => n.order === req.currentNodeOrder);
     if (!currentNode) return { ok: false, message: '当前节点无效' };
-    const trackItem = {
+    const trackItem: ApprovalTrackItem = {
       id: genId('t_'),
       nodeId: currentNode.id,
       nodeName: currentNode.name,
@@ -223,7 +292,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       comment,
       timestamp: new Date().toISOString(),
     };
-    let newStatus = req.status;
+    let newStatus: ApprovalStatus = req.status;
     let newNodeOrder = req.currentNodeOrder;
     if (action === 'reject') {
       newStatus = 'rejected';
@@ -232,20 +301,28 @@ export const useAppStore = create<AppState>((set, get) => ({
       const hasNext = flow.nodes.some(n => n.order === nextOrder);
       if (hasNext) {
         newNodeOrder = nextOrder;
-        const submitItem = {
+        newStatus = 'pending';
+        const nextNode = flow.nodes.find(n => n.order === nextOrder)!;
+        const submitItem: ApprovalTrackItem = {
           id: genId('t_'),
-          nodeId: flow.nodes.find(n => n.order === nextOrder)!.id,
-          nodeName: flow.nodes.find(n => n.order === nextOrder)!.name,
+          nodeId: nextNode.id,
+          nodeName: nextNode.name,
           operatorId: currentUser.id,
           operatorName: currentUser.name,
-          action: 'submit' as const,
+          action: 'submit',
           comment: `${currentNode.name}通过，报送下一节点`,
           timestamp: new Date().toISOString(),
         };
         set(state => ({
           approvalRequests: state.approvalRequests.map(r =>
             r.id === requestId
-              ? { ...r, currentNodeOrder: newNodeOrder, timeline: [...r.timeline, trackItem, submitItem] }
+              ? {
+                  ...r,
+                  status: newStatus,
+                  currentNodeOrder: newNodeOrder,
+                  submissionTime: new Date().toISOString(),
+                  timeline: [...r.timeline, trackItem, submitItem],
+                }
               : r
           ),
         }));

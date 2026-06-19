@@ -8,15 +8,17 @@ import { useAppStore } from '@/store/appStore';
 const AppLayout: React.FC = () => {
   const recomputeMergeCandidates = useAppStore(s => s.recomputeMergeCandidates);
   const recomputeNodeDeadlines = useAppStore(s => s.recomputeNodeDeadlines);
+  const processTimeouts = useAppStore(s => s.processTimeouts);
 
   useEffect(() => {
     recomputeMergeCandidates();
-    recomputeNodeDeadlines();
+    processTimeouts();
     const timer = setInterval(() => {
+      processTimeouts();
       recomputeNodeDeadlines();
     }, 60000);
     return () => clearInterval(timer);
-  }, [recomputeMergeCandidates, recomputeNodeDeadlines]);
+  }, [recomputeMergeCandidates, recomputeNodeDeadlines, processTimeouts]);
 
   return (
     <div className="flex min-h-screen w-full">
